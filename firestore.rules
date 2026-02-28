@@ -1,0 +1,534 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    function userRole(uid) {
+      return get(/databases/$(database)/documents/users/$(uid)).data.role;
+    }
+
+    function isWorker(uid) {
+      return userRole(uid) == "worker";
+    }
+
+    function isEmployer(uid) {
+      return userRole(uid) == "employer";
+    }
+
+    function jobData(jobId) {
+      return get(/databases/$(database)/documents/jobs/$(jobId)).data;
+    }
+
+    function appData(applicationId) {
+      return get(/databases/$(database)/documents/applications/$(applicationId)).data;
+    }
+
+    // Handles multi-write batches/transactions robustly.
+    function appDataAfter(applicationId) {
+      return getAfter(/databases/$(database)/documents/applications/$(applicationId)).data;
+    }
+
+    function threadData(applicationId) {
+      return get(/databases/$(database)/documents/applicationThreads/$(applicationId)).data;
+    }
+
+    function isThreadParticipant(applicationId) {
+      return isSignedIn()
+        && (
+          threadData(applicationId).workerId == request.auth.uid
+          || threadData(applicationId).employerId == request.auth.uid
+        );
+    }
+
+    function validApplicationCreate(applicationId) {
+      let jobId = request.resource.data.jobId;
+      return isSignedIn()
+        && isWorker(request.auth.uid)
+        && request.resource.data.keys().hasOnly([
+          "jobId",
+          "employerId",
+          "workerId",
+          "workerName",
+          "message",
+          "links",
+          "rewardJP",
+          "proposedDeliveryAt",
+          "status",
+          "acceptedAt",
+          "submittedAt",
+          "completedAt",
+          "employerRating",
+          "ratedAt",
+          "createdAt",
+          "updatedAt"
+        ])
+        && request.resource.data.workerId == request.auth.uid
+        && applicationId == (jobId + "_" + request.auth.uid)
+        && exists(/databases/$(database)/documents/jobs/$(jobId))
+        && jobData(jobId).status == "open"
+        && jobData(jobId).employerId != request.auth.uid
+        && request.resource.data.employerId == jobData(jobId).employerId
+        && request.resource.data.rewardJP == jobData(jobId).rewardJP
+        && request.resource.data.status in ["sent", "pending"]
+        && request.resource.data.acceptedAt == null
+        && request.resource.data.submittedAt == null
+        && request.resource.data.completedAt == null
+        && request.resource.data.employerRating == null
+        && request.resource.data.ratedAt == null
+        && request.resource.data.message is string
+        && request.resource.data.message.size() > 0
+        && request.resource.data.message.size() <= 5000
+        && request.resource.data.workerName is string
+        && request.resource.data.workerName.size() > 0
+        && request.resource.data.workerName.size() <= 120
+        && request.resource.data.links is list
+        && request.resource.data.links.size() <= 10;
+    }
+
+    function validApplicationWorkerSubmit() {
+      return isSignedIn()
+        && resource.data.workerId == request.auth.uid
+        && request.resource.data.diff(resource.data).changedKeys().hasOnly(["status", "submittedAt", "updatedAt"])
+        && resource.data.status in ["accepted", "hired"]
+        && request.resource.data.status == "submitted"
+        && request.resource.data.submittedAt != null;
+    }
+
+    function validApplicationEmployerHire() {
+      return isSignedIn()
+        && resource.data.employerId == request.auth.uid
+        && request.resource.data.diff(resource.data).changedKeys().hasOnly(["status", "acceptedAt", "updatedAt"])
+        && resource.data.status in ["pending", "sent", "viewed"]
+        && request.resource.data.status == "hired"
+        && request.resource.data.acceptedAt != null;
+    }
+
+    function validApplicationEmployerReview() {
+      return isSignedIn()
+        && resource.data.employerId == request.auth.uid
+        && request.resource.data.diff(resource.data).changedKeys().hasOnly(["status", "acceptedAt", "updatedAt"])
+        && (
+          (
+            resource.data.status in ["pending", "sent", "viewed"]
+            && request.resource.data.status == "viewed"
+          )
+          || (
+            resource.data.status in ["pending", "sent", "viewed"]
+            && request.resource.data.status == "accepted"
+            && request.resource.data.acceptedAt != null
+          )
+          || (
+            resource.data.status in ["pending", "sent", "viewed", "hired", "accepted", "submitted"]
+            && request.resource.data.status == "rejected"
+          )
+        );
+    }
+
+    function validApplicationEmployerComplete() {
+      let changed = request.resource.data.diff(resource.data).changedKeys();
+      return isSignedIn()
+        && resource.data.employerId == request.auth.uid
+        && changed.hasOnly(["status", "completedAt", "updatedAt", "rating", "review"])
+        && resource.data.status in ["accepted", "hired", "submitted"]
+        && request.resource.data.status == "completed"
+        && request.resource.data.completedAt != null
+        && (
+          !changed.hasAny(["rating", "review"])
+          || (
+            resource.data.rating == null
+            && request.resource.data.rating is int
+            && request.resource.data.rating >= 1
+            && request.resource.data.rating <= 5
+            && request.resource.data.review is string
+            && request.resource.data.review.size() <= 300
+          )
+        );
+    }
+
+    function validApplicationEmployerRating() {
+      return isSignedIn()
+        && resource.data.employerId == request.auth.uid
+        && request.resource.data.diff(resource.data).changedKeys().hasOnly(["employerRating", "ratedAt", "updatedAt"])
+        && resource.data.status == "completed"
+        && resource.data.employerRating == null
+        && request.resource.data.employerRating >= 1
+        && request.resource.data.employerRating <= 5
+        && request.resource.data.ratedAt != null;
+    }
+
+    // Demo-only path for seeded marketplace jobs.
+    function validSeedJobWrite(jobId) {
+      return isSignedIn()
+        && isEmployer(request.auth.uid)
+        && jobId.matches("^seed_job_[1-8]$")
+        && request.resource.data.keys().hasOnly([
+          "employerId",
+          "employerName",
+          "title",
+          "description",
+          "category",
+          "requiredSkills",
+          "level",
+          "rewardJP",
+          "duration",
+          "deadlineAt",
+          "locationType",
+          "city",
+          "attachments",
+          "status",
+          "createdAt",
+          "updatedAt",
+          "applicantsCount",
+          "searchKeywords"
+        ])
+        && request.resource.data.employerId is string
+        && request.resource.data.employerId.matches("^seed_employer_[1-8]$")
+        && request.resource.data.employerName is string
+        && request.resource.data.employerName.size() > 0
+        && request.resource.data.status == "open"
+        && request.resource.data.rewardJP > 0
+        && request.resource.data.applicantsCount >= 0
+        && request.resource.data.applicantsCount <= 5;
+    }
+
+    match /users/{uid} {
+      allow read: if isOwner(uid) || isSignedIn();
+      allow create: if isOwner(uid)
+        && request.resource.data.uid == uid;
+
+      allow update: if (
+        isOwner(uid)
+        && request.resource.data.diff(resource.data).changedKeys().hasOnly([
+          "email",
+          "name",
+          "role",
+          "displayName",
+          "title",
+          "avatarUrl",
+          "photoURL",
+          "coverUrl",
+          "bio",
+          "socials",
+          "hardSkills",
+          "portfolioProjects",
+          "education",
+          "jpBalance",
+          "jobPreppedBalance",
+          "subscriptionTier",
+          "currentStreakDays",
+          "longestStreakDays",
+          "lastActiveDate",
+          "streakFreezeTokens",
+          "completedJobsCount",
+          "jobsCompleted",
+          "totalRatingPoints",
+          "reviewCount",
+          "rating",
+          // Employer-specific fields
+          "companyName",
+          "industry",
+          "website",
+          "hiredCount",
+          "totalJPAwarded",
+          "updatedAt"
+        ])
+      ) || (
+        isSignedIn()
+        && isEmployer(request.auth.uid)
+        && isWorker(uid)
+        && request.resource.data.diff(resource.data).changedKeys().hasOnly([
+          "jpBalance",
+          "jobPreppedBalance",
+          "completedJobsCount",
+          "jobsCompleted",
+          "totalRatingPoints",
+          "reviewCount",
+          "rating",
+          "currentStreakDays",
+          "longestStreakDays",
+          "lastActiveDate",
+          "streakFreezeTokens",
+          "updatedAt"
+        ])
+      );
+
+      allow delete: if isOwner(uid);
+
+      match /myJobs/{jobId} {
+        allow read: if isOwner(uid);
+        allow create, delete: if isOwner(uid);
+        allow update: if isOwner(uid)
+          || (
+            isSignedIn()
+            && isWorker(request.auth.uid)
+            && jobData(jobId).employerId == uid
+            && request.resource.data.diff(resource.data).changedKeys().hasOnly(["applicantsCount", "updatedAt"])
+            && request.resource.data.applicantsCount == resource.data.applicantsCount + 1
+          );
+      }
+
+      match /myApplications/{applicationId} {
+        allow read, write: if isOwner(uid);
+      }
+
+      match /activity/{activityId} {
+        allow read: if isOwner(uid);
+
+        allow create: if isOwner(uid)
+          || (
+            isSignedIn()
+            && isEmployer(request.auth.uid)
+            && request.resource.data.keys().hasOnly(["type", "refId", "createdAt", "dayKey"])
+            && request.resource.data.type == "COMPLETE_JOB"
+            && request.resource.data.refId is string
+            && request.resource.data.refId.size() > 0
+            && request.resource.data.dayKey is string
+            && request.resource.data.dayKey.matches("^\\d{4}-\\d{2}-\\d{2}$")
+            && exists(/databases/$(database)/documents/applications/$(request.resource.data.refId))
+            && appData(request.resource.data.refId).workerId == uid
+            && appData(request.resource.data.refId).employerId == request.auth.uid
+          );
+      }
+
+      match /favorites/{employerId} {
+        allow read, write: if isOwner(uid);
+      }
+
+      match /notifications/{notifId} {
+        allow read: if isOwner(uid);
+
+        allow create: if isOwner(uid)
+          || (
+            isSignedIn()
+            && isEmployer(request.auth.uid)
+            && request.resource.data.keys().hasOnly([
+              "type",
+              "workerId",
+              "employerId",
+              "jobId",
+              "title",
+              "createdAt",
+              "read",
+              "readAt"
+            ])
+            && request.resource.data.type == "NEW_JOB"
+            && request.resource.data.employerId == request.auth.uid
+            && request.resource.data.workerId == uid
+            && request.resource.data.read == false
+            && request.resource.data.readAt == null
+            && exists(/databases/$(database)/documents/jobs/$(request.resource.data.jobId))
+          );
+
+        allow update: if isOwner(uid)
+          && request.resource.data.diff(resource.data).changedKeys().hasOnly(["read", "readAt"]);
+
+        allow delete: if isOwner(uid);
+      }
+    }
+
+    match /jobs/{jobId} {
+      allow read: if isSignedIn();
+
+      allow create: if isSignedIn()
+        && isEmployer(request.auth.uid)
+        && request.resource.data.employerId == request.auth.uid
+        && request.resource.data.keys().hasOnly([
+          "employerId",
+          "employerName",
+          "title",
+          "description",
+          "category",
+          "requiredSkills",
+          "level",
+          "rewardJP",
+          "duration",
+          "deadlineAt",
+          "locationType",
+          "city",
+          "attachments",
+          "status",
+          "createdAt",
+          "updatedAt",
+          "applicantsCount",
+          "searchKeywords"
+        ])
+        && request.resource.data.status == "open"
+        && request.resource.data.applicantsCount == 0
+        && request.resource.data.rewardJP > 0
+        || validSeedJobWrite(jobId);
+
+      allow delete: if isSignedIn() && resource.data.employerId == request.auth.uid;
+
+      allow update: if (
+        isSignedIn()
+        && resource.data.employerId == request.auth.uid
+        && request.resource.data.diff(resource.data).changedKeys().hasOnly(["status", "updatedAt"])
+      ) || (
+        isSignedIn()
+        && isWorker(request.auth.uid)
+        && resource.data.status == "open"
+        && request.resource.data.diff(resource.data).changedKeys().hasOnly(["applicantsCount", "updatedAt"])
+        && request.resource.data.applicantsCount == resource.data.applicantsCount + 1
+      ) || validSeedJobWrite(jobId);
+    }
+
+    match /applications/{applicationId} {
+      allow read: if isSignedIn()
+        && (
+          (
+            resource == null
+            && applicationId.matches("^.+_" + request.auth.uid + "$")
+          )
+          || (
+          resource.data.workerId == request.auth.uid
+          || resource.data.employerId == request.auth.uid
+          || (
+            isEmployer(request.auth.uid)
+            && resource.data.jobId is string
+            && exists(/databases/$(database)/documents/jobs/$(resource.data.jobId))
+            && jobData(resource.data.jobId).employerId == request.auth.uid
+          )
+          || (
+            resource.data.status == "completed"
+            && (
+              resource.data.rating is int
+              || resource.data.rating is float
+            )
+            && resource.data.rating >= 1
+            && resource.data.rating <= 5
+            && resource.data.review is string
+          )
+          )
+        );
+
+      allow create: if validApplicationCreate(applicationId);
+
+      allow update: if validApplicationWorkerSubmit()
+        || validApplicationEmployerHire()
+        || validApplicationEmployerReview()
+        || validApplicationEmployerComplete()
+        || validApplicationEmployerRating();
+
+      allow delete: if false;
+    }
+
+    match /workers/{uid} {
+      allow read: if isSignedIn();
+      allow create: if isOwner(uid);
+
+      allow update: if (
+        isOwner(uid)
+        && request.resource.data.diff(resource.data).changedKeys().hasOnly([
+          "skills",
+          "city",
+          "portfolioUrl",
+          "completedJobsCount",
+          "acceptedApplicationsCount",
+          "submissionsCount",
+          "avgEmployerRating",
+          "ratingsCount",
+          "onTimeRate",
+          "responseRate",
+          "totalEarnedJP",
+          "weeklyEarnedJP",
+          "skillPentagon",
+          "updatedAt",
+          "createdAt"
+        ])
+      ) || (
+        isSignedIn()
+        && isEmployer(request.auth.uid)
+        && isWorker(uid)
+        && request.resource.data.diff(resource.data).changedKeys().hasOnly([
+          "completedJobsCount",
+          "acceptedApplicationsCount",
+          "submissionsCount",
+          "avgEmployerRating",
+          "ratingsCount",
+          "onTimeRate",
+          "responseRate",
+          "totalEarnedJP",
+          "weeklyEarnedJP",
+          "skillPentagon",
+          "updatedAt"
+        ])
+      );
+
+      allow delete: if isOwner(uid);
+    }
+
+    match /employers/{uid} {
+      allow read, write: if isOwner(uid);
+
+      match /followers/{workerId} {
+        allow read: if isOwner(uid) || isOwner(workerId);
+
+        allow create: if isOwner(workerId)
+          && request.resource.data.workerId == workerId;
+
+        allow delete: if isOwner(workerId) || isOwner(uid);
+      }
+    }
+
+    match /applicationThreads/{applicationId} {
+      allow read: if isSignedIn()
+        && (resource.data.workerId == request.auth.uid || resource.data.employerId == request.auth.uid);
+
+      allow create: if isSignedIn()
+        && request.resource.data.keys().hasOnly([
+          "applicationId",
+          "jobId",
+          "employerId",
+          "workerId",
+          "createdAt",
+          "lastMessageAt",
+          "lastMessageText"
+        ])
+        && request.resource.data.applicationId == applicationId
+        && request.resource.data.workerId == request.auth.uid
+        && (
+          (
+            exists(/databases/$(database)/documents/applications/$(applicationId))
+            && appData(applicationId).workerId == request.auth.uid
+            && request.resource.data.employerId == appData(applicationId).employerId
+            && request.resource.data.jobId == appData(applicationId).jobId
+          )
+          || (
+            existsAfter(/databases/$(database)/documents/applications/$(applicationId))
+            && appDataAfter(applicationId).workerId == request.auth.uid
+            && request.resource.data.employerId == appDataAfter(applicationId).employerId
+            && request.resource.data.jobId == appDataAfter(applicationId).jobId
+          )
+        );
+
+      allow update: if isSignedIn()
+        && (resource.data.workerId == request.auth.uid || resource.data.employerId == request.auth.uid)
+        && request.resource.data.diff(resource.data).changedKeys().hasOnly(["lastMessageAt", "lastMessageText", "lastReadAtBy"]);
+
+      allow delete: if false;
+
+      match /messages/{messageId} {
+        allow read: if isThreadParticipant(applicationId);
+
+        allow create: if isThreadParticipant(applicationId)
+          && request.resource.data.keys().hasOnly(["senderId", "text", "createdAt", "readBy", "type"])
+          && request.resource.data.senderId == request.auth.uid
+          && request.resource.data.type in ["text", "system"]
+          && request.resource.data.text is string
+          && request.resource.data.text.size() > 0
+          && request.resource.data.text.size() <= 5000;
+
+        allow update: if isThreadParticipant(applicationId)
+          && request.resource.data.diff(resource.data).changedKeys().hasOnly(["readBy"]);
+
+        allow delete: if false;
+      }
+    }
+  }
+}
